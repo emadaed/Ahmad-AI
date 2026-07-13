@@ -1,0 +1,46 @@
+# Virtual Environments
+venv/
+venv*/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+venv312/
+venvvenu/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Chroma / Vector DB
+chroma_db/
+vectorstore/
