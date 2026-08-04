@@ -2,6 +2,7 @@ import sys
 import operator
 import json
 import re
+import psycopg2
 from typing import TypedDict, Annotated, Literal
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.tools import tool
@@ -100,12 +101,28 @@ Your priorities are:
 18. If a question has multiple parts, make sure you address each part using what was
     retrieved. Don't drop or refuse a part just because a different part triggered
     caution.
-19. Only use get_current_time or search_knowledge_base when the question is
-    specifically about the current date/time, or about Ahmad-AI's own internal
-    files, projects, servers, or configuration. For general knowledge, math,
-    science, religion, or anything you can already answer confidently yourself,
-    answer directly WITHOUT calling any tool. Never call a tool "just in case."
+19. Only use get_current_time, search_knowledge_base, or query_groweasy_db when the
+    question is specifically about the current date/time, Ahmad-AI's own internal
+    files/projects/servers/configuration, or real GrowEasy business data (SKUs,
+    suppliers, purchase orders, classifications, KPIs, customers, stock). For general
+    knowledge, math, science, religion, or anything you can already answer confidently
+    yourself, answer directly WITHOUT calling any tool. Never call a tool "just in case."
     If you're unsure whether a tool is needed, default to NOT using one.
+    Greetings and small talk (e.g. "hi", "hello", "how are you", "thanks") NEVER need
+    a tool — always answer these directly with a short reply, no matter what.
+20. When answering from query_groweasy_db results, state ONLY values that are literally
+    present in the returned rows. Do not infer, estimate, or explain WHY a value is what
+    it is (e.g. why a SKU is classified "A", why a supplier's KPI is low) unless that
+    reasoning is itself a column in the data. If the user asks a question the returned
+    columns don't cover, say plainly that the data available doesn't include that detail
+    — do not fill the gap with a plausible-sounding guess. If a query returns no rows,
+    say clearly that no matching data was found, and do not guess a plausible-sounding
+    substitute value instead.
+21. Before calling query_groweasy_db, confirm that an allowed table actually covers the
+    specific metric being asked about (see the tool's docstring for allowed tables and
+    known columns). If nothing in the allowed tables covers it — e.g. profit margin,
+    revenue, or any other financial metric not listed — do NOT query the nearest-sounding
+    table. Say plainly that GrowEasy doesn't currently expose that data.
 
 KNOWN FACTS (use these exact definitions, do not improvise on these specific terms):
 - RAG = Retrieval-Augmented Generation. It means retrieving relevant documents/text
@@ -134,11 +151,16 @@ KNOWN FACTS (use these exact definitions, do not improvise on these specific ter
 
 Response style: Clear, direct, honest, respectful, practical. No unnecessary decoration.
 
-If the user asks something outside your knowledge, respond with:
+If the user asks something outside your knowledge, respond with EXACTLY this sentence and
+nothing else:
 "I am not sure. I should not guess without verification."
 
-If the user asks for Islamic evidence and you are not certain of the EXACT reference, respond with:
+If the user asks for Islamic evidence (a Quran verse or Hadith) and you are not certain of
+the EXACT reference, respond with EXACTLY this sentence and NOTHING ELSE — no book name, no
+number, no "a possible hadith is...", no quote, not even a hedged one:
 "I recall the general meaning, but I cannot confirm the exact Quran/Hadith reference from memory. Please verify with a trusted scholar or source."
+This sentence IS your complete answer for that turn. Do not add any further explanation,
+citation, or attempted reference after it.
 """
 
 @tool
@@ -161,8 +183,131 @@ def search_knowledge_base(query: str) -> str:
     results = "\n\n".join([doc.page_content for doc in docs])
     return f"Database Results:\n{results}"
 
-tools = [get_current_time, search_knowledge_base]
+# --- GrowEasy DB (local, read-only test copy) ---
+GROWEASY_DB_CONFIG = {
+    "host": "localhost",
+    "port": 5433,
+    "dbname": "groweasy_dev",
+    "user": "ahmad_ai_readonly",
+    "password": "localonlypass",
+}
+
+# Only these tables are queryable. Add more here as you trust the tool with them.
+GROWEASY_ALLOWED_TABLES = {
+    "scm_item_classifications",
+    "scm_suggested_orders",
+    "scm_engine_run_logs",
+    "scm_inventory_items",
+    "supplier_kpis",
+    "suppliers",
+    "inventory_items",
+    "customers",
+    "purchase_orders",
+    "stock_alerts",
+    "stock_movements",
+}
+
+_SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z0-9_]+$")
+
+@tool
+def query_groweasy_db(table_name: str, filters: dict = None, order_by: str = None, limit: int = 10) -> str:
+    """Query real GrowEasy ERP data (read-only, local test database). Use this when the
+    user asks about actual SKUs, suppliers, purchase orders, ABC/item classifications,
+    supplier KPIs, customers, or stock levels/alerts stored in GrowEasy — NOT for general
+    questions you can already answer.
+    Before calling this tool, confirm the metric asked about is actually covered by one of
+    the allowed tables below. If it isn't (e.g. profit margin, revenue — not tracked here),
+    do not call this tool at all; tell the user that data isn't available in GrowEasy.
+    Allowed table_name values: scm_item_classifications, scm_suggested_orders,
+    scm_engine_run_logs, scm_inventory_items, supplier_kpis, suppliers, inventory_items,
+    customers, purchase_orders, stock_alerts, stock_movements.
+    Known column names: scm_item_classifications.abc_class holds 'A'/'B'/'C' (NOT
+    "classification"). supplier_kpis.composite_score is the overall KPI rollup score
+    (NOT "kpi_score") — lower composite_score means worse supplier performance.
+    filters: optional dict of column: value for exact-match conditions, e.g. {"abc_class": "A"}.
+    order_by: optional column name to sort by; prefix with '-' for descending (highest
+    first), no prefix for ascending (lowest first).
+    Example: "lowest"/"worst" composite_score -> order_by='composite_score' (ascending,
+    no prefix). "highest"/"best" composite_score -> order_by='-composite_score'
+    (descending). Do not default to descending when the user asks for "lowest" or "worst".
+    limit: max rows to return (default 10, capped at 50)."""
+    if table_name not in GROWEASY_ALLOWED_TABLES:
+        return (f"Error: table '{table_name}' is not allowed. Allowed tables: "
+                 f"{', '.join(sorted(GROWEASY_ALLOWED_TABLES))}")
+
+    try:
+        limit = min(max(int(limit), 1), 50)
+    except (TypeError, ValueError):
+        limit = 10
+
+    query = f"SELECT * FROM {table_name}"
+    params = []
+
+    if filters:
+        conditions = []
+        for col, val in filters.items():
+            if not _SAFE_IDENTIFIER.match(col):
+                return f"Error: invalid filter column name '{col}'."
+            conditions.append(f"{col} = %s")
+            params.append(val)
+        query += " WHERE " + " AND ".join(conditions)
+
+    if order_by:
+        col = order_by.lstrip("-")
+        if not _SAFE_IDENTIFIER.match(col):
+            return f"Error: invalid order_by column '{order_by}'."
+        direction = "DESC" if order_by.startswith("-") else "ASC"
+        query += f" ORDER BY {col} {direction}"
+
+    query += f" LIMIT {limit}"
+
+    try:
+        conn = psycopg2.connect(**GROWEASY_DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute(query, params)
+        columns = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return f"Database query error: {e}"
+
+    if not rows:
+        return "No matching rows found."
+
+    results = [dict(zip(columns, row)) for row in rows]
+    return f"Query results ({len(results)} rows):\n{json.dumps(results, default=str, indent=2)}"
+
+tools = [get_current_time, search_knowledge_base, query_groweasy_db]
 main_llm_with_tools = main_llm.bind_tools(tools)
+
+# --- Deterministic safety net for Islamic citations ----------------------------------
+# The system prompt already forbids stating an unverified hadith/Quran reference, but a
+# local model can still drift off that rule mid-response (seen in testing: it hedged
+# correctly, then fabricated a citation anyway). This regex guard is a backstop that does
+# NOT rely on the model obeying the instruction — if the reply contains something that
+# looks like a specific citation and it isn't explicitly whitelisted, the whole reply is
+# replaced with the safe fallback sentence before it ever reaches the user.
+_CITATION_PATTERN = re.compile(
+    r"(sahih\s+(bukhari|muslim)|sunan|musnad|tirmidhi|nasa'?i|ibn\s+majah)"
+    r"\s*[\(,]?\s*(book|vol(ume)?|chapter)?\s*\d+.{0,25}(number|hadith|no\.?)\s*\d+"
+    r"|surah\s+[a-zA-Z\-\s]+\s*\d+\s*:\s*\d+",
+    re.IGNORECASE,
+)
+_ALLOWED_CITATIONS = {"20:114"}  # keep in sync with the KNOWN FACTS section above
+
+SAFE_ISLAMIC_FALLBACK = (
+    "I recall the general meaning, but I cannot confirm the exact Quran/Hadith reference "
+    "from memory. Please verify with a trusted scholar or source."
+)
+
+
+def enforce_citation_guard(text: str) -> str:
+    """Strip any unverified specific Quran/Hadith citation the model states anyway."""
+    for match in _CITATION_PATTERN.finditer(text):
+        if not any(allowed in match.group(0) for allowed in _ALLOWED_CITATIONS):
+            return SAFE_ISLAMIC_FALLBACK
+    return text
 
 # 4. Define Graph State
 class AgentState(TypedDict):
@@ -171,7 +316,9 @@ class AgentState(TypedDict):
 
 # 5. Define Nodes
 def route_question(state: AgentState):
-    """LLM-based Router Node: Inspects user intent using the fast model."""
+    """LLM-based Router Node: Inspects user intent using the fast model.
+    NOTE: currently NOT wired into the graph below (kept disconnected on purpose,
+    matching how the previous version ran) — see chat notes on why before enabling."""
     last_msg = state["messages"][-1].content
     
     # We ask the fast 3B model to strictly classify the intent
@@ -195,6 +342,7 @@ def call_main_model_no_tools(state: AgentState):
     """For general knowledge, we use the main brain WITHOUT giving it the tools."""
     messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
     response = main_llm.invoke(messages)
+    response.content = enforce_citation_guard(response.content)
     return {"messages": [response]}
 
 def call_main_model_with_tools(state: AgentState):
@@ -218,7 +366,10 @@ def call_main_model_with_tools(state: AgentState):
                     response.content = "Let me look that up for you..."
         except Exception:
             pass
-            
+
+    if not response.tool_calls:
+        response.content = enforce_citation_guard(response.content)
+
     return {"messages": [response]}
 
 def execute_tools(state: AgentState):
@@ -237,6 +388,11 @@ def execute_tools(state: AgentState):
                 print(f"\n[System: Searching your files for '{query_text}'...]")
                 res = search_knowledge_base.invoke(tool_args)
                 print(f"[System Diagnostic: Raw retrieved content -> {res}]")
+            elif tool_name == "query_groweasy_db":
+                print(f"\n[System: Querying GrowEasy DB -> table={tool_args.get('table_name')}, "
+                      f"filters={tool_args.get('filters')}, order_by={tool_args.get('order_by')}]")
+                res = query_groweasy_db.invoke(tool_args)
+                print(f"[System Diagnostic: Raw DB result -> {res}]")
             else:
                 res = f"Tool {tool_name} not found."
                 
@@ -270,6 +426,7 @@ if __name__ == "__main__":
     print("="*50 + "\n")
 
     chat_history = []
+    MAX_HISTORY_MESSAGES = 12  # caps how much history is re-sent/re-processed each turn
 
     while True:
         user_input = input("You: ")
@@ -281,7 +438,8 @@ if __name__ == "__main__":
             continue
 
         chat_history.append(HumanMessage(content=user_input))
-        result = app.invoke({"messages": chat_history})
+        model_input = chat_history[-MAX_HISTORY_MESSAGES:]
+        result = app.invoke({"messages": model_input})
         final_answer = result["messages"][-1]
         print(f"\nAhmad-AI: {final_answer.content}\n")
         chat_history.append(final_answer)
